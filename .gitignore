@@ -1,5 +1,6 @@
 app/.icon-1024.png
 .DS_Store
+.venv/
 
 # Build output (app/build.sh: swiftc + GyroflowBatch.app bundle)
 app/GyroflowBatch.app/

@@ -26,9 +26,9 @@
 #                      every export
 #   --fps <FPS>      — frame rate for image sequences (required if any DNG
 #                      sequence directories are present in VIDEO_FOLDER)
-#   --sync-search-ms <N>  optical-flow sync search window in milliseconds per
-#                      sync point (default 500; Gyroflow default without override
-#                      is 5000)
+#   --max-offset-ms <N>  drop autosync points with |offset| > N ms, then keep only the
+#                      first and last among those still in range (may be none). Offsets
+#                      are ms in the project file. Gyroflow search_size is always 5s.
 #
 # Example:
 #   ./gyroflow_export_projects.sh \
@@ -37,6 +37,23 @@
 # CLI reference: https://docs.gyroflow.xyz/app/advanced-usage/command-line-cli
 
 set -euo pipefail
+
+# Repo root (for gyroflow_batch_helpers.py and video_extensions.txt).
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export GYROFLOW_BATCH_SCRIPT_DIR="$SCRIPT_DIR"
+
+# Pipe-delimited alternation for [[ ext =~ ^(a|b)$ ]] — single source with
+# video_extensions.txt and resolve_gyroflow_timeline.py.
+VIDEO_EXTENSIONS=""
+while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ "$line" =~ ^[[:space:]]*# ]] && continue
+    line="${line%%#*}"
+    line="${line//[[:space:]]/}"
+    [[ -z "$line" ]] && continue
+    line=$(printf '%s' "$line" | tr '[:upper:]' '[:lower:]')
+    if [[ -n "$VIDEO_EXTENSIONS" ]]; then VIDEO_EXTENSIONS+="|"; fi
+    VIDEO_EXTENSIONS+="$line"
+done < "$SCRIPT_DIR/video_extensions.txt"
 
 # ── Configuration ────────────────────────────────────────────────────
 GYROFLOW="/Applications/Gyroflow.app/Contents/MacOS/gyroflow"
@@ -48,16 +65,38 @@ GYROFLOW="/Applications/Gyroflow.app/Contents/MacOS/gyroflow"
 #   4 = video + project file
 EXPORT_MODE=2
 
-VIDEO_EXTENSIONS="mp4|mov|avi|mkv|mxf|braw|r3d|insv"
-
 # Maximum seconds to wait for a single Gyroflow invocation before killing it.
 GYROFLOW_TIMEOUT=300
 
-# Optical-flow auto-sync: number of sync points (synchronization.max_sync_points).
+# Optical-flow auto-sync: first CLI pass asks for up to this many sync points, then
+# offsets with |value| > MAX_SYNC_OFFSET_MS are dropped; of those left, only the first
+# and last sync point are kept (gyroflow_batch_helpers). Second pass uses AUTO_SYNC_POINTS.
+SYNC_MAX_POINTS_INITIAL=6
+
+# Fallback max sync points (second Gyroflow attempt) if the first pass fails.
 AUTO_SYNC_POINTS=2
 
-# Per-sync-point search window for optical-flow sync (seconds). Gyroflow default is 5s.
-SYNC_SEARCH_SIZE_SECONDS=0.5
+# Always passed to Gyroflow ``-s`` as search_size (seconds); matches app default.
+GYROFLOW_SYNC_SEARCH_SECONDS=5
+
+# Optional: merged into Gyroflow ``-s`` (synchronization) for optical-flow autosync quality.
+# ``of_method``: 0=AKAZE (slower, often better), 1=OpenCV PyrLK, 2=OpenCV DIS (Gyroflow CLI default).
+# Leave empty to take this field only from PROJECT_DEFAULTS (preset).
+GYROFLOW_SYNC_OF_METHOD=""
+
+# ``processing_resolution``: target frame height in pixels for sync (same meaning as the GUI).
+# For GUI "Full", set this to the clip's native height (e.g. 1080, 2160). Empty = preset only.
+GYROFLOW_SYNC_PROCESSING_RESOLUTION=""
+
+# Drop autosync points whose |offset| exceeds this (milliseconds in project JSON).
+# Default 5000 aligns with Gyroflow’s 5s search; lower (e.g. 500) to strip large outliers only.
+MAX_SYNC_OFFSET_MS=5000
+
+# DNG proxy sync encodes an h.264 mp4 for Gyroflow CLI (optical-flow autosync). Full-res
+# 4K+ sequences are prohibitively slow; sync offsets are time-based and resolution-
+# independent, so we cap proxy frame height (ffmpeg lanczos scale). Set 0 to disable
+# scaling (full-resolution proxy — slow).
+DNG_PROXY_SYNC_MAX_HEIGHT=720
 
 # ── Parse arguments ──────────────────────────────────────────────────
 if [[ $# -lt 5 ]]; then
@@ -66,13 +105,13 @@ Usage:
   gyroflow_export_projects.sh \
       <PROJECT_FOLDER> <MOTION_FOLDER> <VIDEO_FOLDER> \
       <LENS_FOLDER> <PROJECT_DEFAULTS> \
-      [--fps <FPS>] [--force] [--sync-search-ms <MS>]
+      [--fps <FPS>] [--force] [--max-offset-ms <MS>]
 
   --fps              Frame rate for DNG image sequences (required when sequences exist)
   --force            Rebuild .gyroflow files even if they already exist (needed after
                      changing sync behavior or to re-run DNG proxy merge)
-  --sync-search-ms   Auto-sync search window in ms per point (default 500; omit to use
-                     built-in default)
+  --max-offset-ms    Drop autosync points with |offset| > this (ms), then keep only the
+                     first/last of those still in range (may be zero). search_size 5s. Default 5000.
 EOF
     exit 1
 fi
@@ -96,22 +135,20 @@ while [[ $# -gt 0 ]]; do
             FORCE_RESYNC=1
             shift
             ;;
-        --sync-search-ms)
+        --max-offset-ms)
             if [[ $# -lt 2 ]]; then
-                echo "Error: --sync-search-ms requires a value (milliseconds)"
+                echo "Error: --max-offset-ms requires a value (milliseconds)"
                 exit 1
             fi
             if ! [[ "$2" =~ ^[0-9]+$ ]]; then
-                echo "Error: --sync-search-ms must be a non-negative integer (milliseconds)"
+                echo "Error: --max-offset-ms must be a non-negative integer (milliseconds)"
                 exit 1
             fi
             if (( 10#$2 < 1 || 10#$2 > 600000 )); then
-                echo "Error: --sync-search-ms must be between 1 and 600000"
+                echo "Error: --max-offset-ms must be between 1 and 600000"
                 exit 1
             fi
-            SYNC_SEARCH_SIZE_SECONDS=$(
-                python3 -c "import sys; print(int(sys.argv[1]) / 1000.0)" "$2"
-            )
+            MAX_SYNC_OFFSET_MS=$((10#$2))
             shift 2
             ;;
         *)
@@ -185,9 +222,7 @@ find_lens_profile() {
 is_image_sequence_dir() {
     local dir="$1"
     [[ -d "$dir" ]] || return 1
-    local count
-    count=$(find "$dir" -maxdepth 1 -iname "*.dng" -print -quit 2>/dev/null | wc -l)
-    [[ $count -gt 0 ]]
+    [[ -n "$(find "$dir" -maxdepth 1 -iname "*.dng" -print -quit 2>/dev/null)" ]]
 }
 
 # Strip stale paths / bookmarks from a preset so CLI export cannot target old
@@ -264,10 +299,13 @@ with open(sys.argv[2], 'w') as f:
 }
 
 # JSON for Gyroflow -s: merge preset synchronization but force do_autosync,
-# max_sync_points, and search_size (preset value 0 disables autosync — we always
-# use AUTO_SYNC_POINTS; default Gyroflow search_size is 5s — we use SYNC_SEARCH_SIZE_SECONDS).
+# max_sync_points, and search_size=5s (Gyroflow default; not user-tunable here).
+# Optional 2nd arg: max_sync_points (default AUTO_SYNC_POINTS).
+# Optional 4th/5th args: non-empty overrides for of_method and processing_resolution
+# (see GYROFLOW_SYNC_OF_METHOD / GYROFLOW_SYNC_PROCESSING_RESOLUTION).
 gyroflow_sync_params_json_from_preset() {
     local preset_file="$1"
+    local max_points="${2:-$AUTO_SYNC_POINTS}"
     python3 -c 'import json, sys
 with open(sys.argv[1]) as f:
     p = json.load(f)
@@ -281,6 +319,10 @@ else:
 sync["do_autosync"] = True
 sync["max_sync_points"] = int(sys.argv[2])
 sync["search_size"] = float(sys.argv[3])
+if len(sys.argv) > 4 and sys.argv[4] != "":
+    sync["of_method"] = int(sys.argv[4])
+if len(sys.argv) > 5 and sys.argv[5] != "":
+    sync["processing_resolution"] = int(sys.argv[5])
 tp = sync.get("time_per_syncpoint", 1.0)
 try:
     tp = float(tp)
@@ -289,7 +331,8 @@ except (TypeError, ValueError):
 if tp < 0.1:
     sync["time_per_syncpoint"] = 1.0
 print(json.dumps(sync, separators=(",", ":")))
-' "$preset_file" "$AUTO_SYNC_POINTS" "$SYNC_SEARCH_SIZE_SECONDS"
+' "$preset_file" "$max_points" "$GYROFLOW_SYNC_SEARCH_SECONDS" \
+        "${GYROFLOW_SYNC_OF_METHOD:-}" "${GYROFLOW_SYNC_PROCESSING_RESOLUTION:-}"
 }
 
 # Temporarily clear Gyroflow's Application Support settings and macOS defaults
@@ -397,7 +440,7 @@ build_dng_project() {
     fi
 
     python3 - "$seq_dir" "$fps" "$lens_path" "$gcsv_path" "$preset_path" "$output_path" <<'PYEOF'
-import json, sys, os, struct, re
+import json, sys, os, struct
 from datetime import date
 
 seq_dir     = sys.argv[1]
@@ -406,6 +449,20 @@ lens_path   = sys.argv[3]
 gcsv_path   = sys.argv[4]
 preset_path = sys.argv[5]
 output_path = sys.argv[6]
+
+_root = os.environ.get("GYROFLOW_BATCH_SCRIPT_DIR")
+if not _root:
+    print("Error: GYROFLOW_BATCH_SCRIPT_DIR is not set", file=sys.stderr)
+    sys.exit(1)
+sys.path.insert(0, _root)
+from gyroflow_batch_helpers import (
+    canonical_dng_filenames,
+    deep_merge,
+    dng_sequence_videofile_url,
+    file_url_from_local_path,
+    lens_profile_json_looks_valid,
+    normalize_gyro_source_after_preset_merge,
+)
 
 
 def read_dng_dimensions(path):
@@ -464,20 +521,8 @@ def read_gcsv_header(path):
     return header
 
 
-def deep_merge(base, override):
-    """Recursively merge override dict into base dict."""
-    for key, val in override.items():
-        if key in base and isinstance(base[key], dict) and isinstance(val, dict):
-            deep_merge(base[key], val)
-        else:
-            base[key] = val
-
-
-# ── Discover DNG files ───────────────────────────────────────────────
-dng_files = sorted(
-    f for f in os.listdir(seq_dir)
-    if f.lower().endswith(".dng")
-)
+# ── Discover DNG files (same order as sync_dng_project / ffmpeg — see gyroflow_batch_helpers) ──
+dng_files = canonical_dng_filenames(seq_dir)
 if not dng_files:
     print("Error: no .dng files found in " + seq_dir, file=sys.stderr)
     sys.exit(1)
@@ -486,11 +531,8 @@ first_dng_name = dng_files[0]
 first_dng_path = os.path.join(seq_dir, first_dng_name)
 dng_count = len(dng_files)
 
-# ── Extract sequence start frame number from filename ────────────────
-seq_start = 0
-m = re.search(r"(\d+)\.dng$", first_dng_name, re.IGNORECASE)
-if m:
-    seq_start = int(m.group(1))
+# ── videofile URL: use %0Nd pattern (Gyroflow GUI resets fps / prompts if literal first frame)
+video_url, seq_start = dng_sequence_videofile_url(seq_dir)
 
 # ── Read DNG dimensions ─────────────────────────────────────────────
 width, height = read_dng_dimensions(first_dng_path)
@@ -501,19 +543,22 @@ duration_ms = (dng_count / fps) * 1000.0
 # ── Read lens profile ────────────────────────────────────────────────
 with open(lens_path, "r") as f:
     calibration_data = json.load(f)
+if not lens_profile_json_looks_valid(calibration_data):
+    print(
+        "Warning: lens profile JSON may not load in Gyroflow (need full LensProfile: "
+        "calibrator_version, calib_dimension.w/h, fisheye_params.camera_matrix). "
+        "Use a profile exported from Gyroflow's lens database or a .json that matches that schema.",
+        file=sys.stderr,
+    )
 
 # ── Read .gcsv header ────────────────────────────────────────────────
 gcsv_header = read_gcsv_header(gcsv_path)
 imu_orientation = gcsv_header.get("orientation", "XYZ")
 detected_source = gcsv_header.get("vendor", gcsv_header.get("id", ""))
 
-# ── Build file:// URLs ───────────────────────────────────────────────
-first_dng_abs = os.path.realpath(first_dng_path)
+# ── Build file:// URL for motion file (encode % for Qt / Gyroflow) ───────
 gcsv_abs = os.path.realpath(gcsv_path)
-
-# Gyroflow uses file:// URLs (three slashes for absolute paths on macOS)
-video_url = "file://" + first_dng_abs
-gcsv_url  = "file://" + gcsv_abs
+gcsv_url = file_url_from_local_path(gcsv_abs)
 
 # ── Construct project JSON (matches Gyroflow v1.6.3 GUI export, root version 3)
 project = {
@@ -588,10 +633,10 @@ project = {
 # ── Merge preset defaults into project ───────────────────────────────
 if preset_path and os.path.isfile(preset_path):
     try:
-        with open(preset_path, "r") as f:
+        with open(preset_path, "r", encoding="utf-8") as f:
             preset = json.load(f)
         deep_merge(project, preset)
-    except Exception as e:
+    except (json.JSONDecodeError, OSError, UnicodeError) as e:
         print(f"Warning: could not merge preset: {e}", file=sys.stderr)
 
 # Ensure our video-specific fields aren't clobbered by the preset
@@ -600,6 +645,7 @@ project["image_sequence_start"] = seq_start
 project["image_sequence_fps"] = fps
 project["calibration_data"] = calibration_data
 project["gyro_source"]["filepath"] = gcsv_url
+normalize_gyro_source_after_preset_merge(project["gyro_source"])
 project["video_info"]["width"] = width
 project["video_info"]["height"] = height
 project["video_info"]["num_frames"] = dng_count
@@ -638,21 +684,30 @@ sync_dng_project() {
     # Motion file passed to Gyroflow for proxy sync (copy with header tweaks if needed).
     local gcsv_for_proxy="$gcsv_path"
 
-    # ── a) Determine ffmpeg input pattern from first DNG ─────────────
-    local first_dng
-    first_dng=$(find "$seq_dir" -maxdepth 1 -iname "*.dng" 2>/dev/null \
-        | sort | head -n1)
-    if [[ -z "$first_dng" ]]; then
-        echo "      sync: no DNG files found in $seq_dir" >&2
+    # ── a) First DNG, count, literal extension (canonical — gyroflow_batch_helpers) ──
+    local first_dng dng_count dng_ext
+    {
+        read -r first_dng
+        read -r dng_count
+        read -r dng_ext
+    } < <(python3 -c "
+import json, os, sys
+sys.path.insert(0, os.environ['GYROFLOW_BATCH_SCRIPT_DIR'])
+from gyroflow_batch_helpers import dng_sequence_metadata
+m = dng_sequence_metadata(sys.argv[1])
+print(m['first_path'])
+print(m['count'])
+print(m['ext'])
+" "$seq_dir") || {
+        echo "      sync: no DNG files or metadata failed in $seq_dir" >&2
         return 1
-    fi
+    }
 
     local first_name
     first_name="$(basename "$first_dng")"
 
     local prefix num_suffix pad seq_start
-    if [[ "$first_name" =~ ^(.*[^0-9])([0-9]+)\.dng$ ]] || \
-       [[ "$first_name" =~ ^(.*[^0-9])([0-9]+)\.DNG$ ]]; then
+    if [[ "$first_name" =~ ^(.*[^0-9])([0-9]+)\.[dD][nN][gG]$ ]]; then
         prefix="${BASH_REMATCH[1]}"
         num_suffix="${BASH_REMATCH[2]}"
         pad=${#num_suffix}
@@ -662,9 +717,8 @@ sync_dng_project() {
         return 1
     fi
 
-    local ffmpeg_pattern="${seq_dir}/${prefix}%0${pad}d.dng"
-    local dng_count
-    dng_count=$(find "$seq_dir" -maxdepth 1 -iname "*.dng" 2>/dev/null | wc -l | tr -d ' ')
+    # Literal extension (e.g. .DNG) so ffmpeg finds frames on case-sensitive volumes.
+    local ffmpeg_pattern="${seq_dir}/${prefix}%0${pad}d${dng_ext}"
 
     local sync_dir
     sync_dir="$(dirname "$project_file")/.gyroflow_sync"
@@ -681,13 +735,20 @@ sync_dng_project() {
     mv "$tmp_proxy" "${tmp_proxy}.mp4"
     tmp_proxy="${tmp_proxy}.mp4"
 
-    echo "      syncing via proxy ($dng_count DNG frames → full-res mp4)…"
+    if [[ "${DNG_PROXY_SYNC_MAX_HEIGHT:-0}" =~ ^[0-9]+$ ]] && (( DNG_PROXY_SYNC_MAX_HEIGHT > 0 )); then
+        echo "      syncing via proxy ($dng_count DNG frames → mp4, max height ${DNG_PROXY_SYNC_MAX_HEIGHT}px)…"
+        local vf_proxy
+        vf_proxy="scale=-2:min(ih\\,${DNG_PROXY_SYNC_MAX_HEIGHT}):flags=lanczos,crop=iw-mod(iw\\,2):ih-mod(ih\\,2),format=yuv420p"
+    else
+        echo "      syncing via proxy ($dng_count DNG frames → full-res mp4)…"
+        local vf_proxy
+        vf_proxy="crop=iw-mod(iw\,2):ih-mod(ih\,2),format=yuv420p"
+    fi
 
     local ffmpeg_start
     ffmpeg_start=$(date +%s)
 
-    # Full resolution (no scale down). Crop at most 1px per axis if needed so
-    # yuv420p / libx264 accept odd dimensions; even-sized sources are unchanged.
+    # Crop at most 1px per axis if needed so yuv420p / libx264 accept odd dimensions.
     # Strip global metadata/chapters from the proxy: DNG/XMP can embed absolute paths
     # from an old project; Gyroflow may read those tags and resolve export paths there
     # (observed even when --preset is fully sanitized and -p points at .gyroflow_sync/).
@@ -696,7 +757,7 @@ sync_dng_project() {
         -i "$ffmpeg_pattern" \
         -map_metadata -1 -map_chapters -1 \
         -c:v libx264 -preset ultrafast -crf 30 \
-        -vf "crop=iw-mod(iw\,2):ih-mod(ih\,2),format=yuv420p" \
+        -vf "$vf_proxy" \
         -y "$tmp_proxy" 2>&1 | sed 's/^/      ffmpeg: /'; then
         echo "      sync: ffmpeg proxy creation failed" >&2
         rm -f "$tmp_proxy"
@@ -819,193 +880,151 @@ print(json.dumps(out))
 ' "$tmp_proxy"
     )
 
-    # Merge synchronization: -s forces do_autosync and max_sync_points on top of the
-    # sanitized preset (same as video export). Gyroflow's render queue runs optical-flow
-    # autosync only when sync_settings contains "do_autosync": true (render_queue.rs).
-    # Force max_sync_points to AUTO_SYNC_POINTS (preset 0 would disable autosync).
-    local sync_params_json=""
-    sync_params_json=$(gyroflow_sync_params_json_from_preset "$tmp_preset")
+    # Merge synchronization: -s forces do_autosync and max_sync_points (first 6, then 2).
+    # After each successful export, trim with MAX_SYNC_OFFSET_MS (apply-offset-policy):
+    # drop |offset| > max, then first/last of those in range; may have no sync points.
+    local helpers_py="${GYROFLOW_BATCH_SCRIPT_DIR}/gyroflow_batch_helpers.py"
+    local sync_trim_ok=false
+    local proxy_project=""
+    local attempt max_pts sync_params_json gyro_output gyro_pid gyro_timed_out gyro_elapsed gyro_rc
 
-    local proxy_cmd=(
-        "$GYROFLOW"
-        "$tmp_proxy"
-        "$lens_path"
-        -g "$gcsv_for_proxy"
-        --preset "$tmp_preset"
-        -s "$sync_params_json"
-    )
-    proxy_cmd+=(
-        -p "$out_params_json"
-        --export-project "$EXPORT_MODE"
-    )
-
-    local gyro_output
-    gyro_output=$(mktemp "${sync_dir}/sync_log_XXXXXX")
-    # Avoid Qt/macOS bookmark issues when locale is "C" (US-ASCII); Gyroflow warns otherwise.
-    LC_ALL=C.UTF-8 LANG=C.UTF-8 "${proxy_cmd[@]}" > "$gyro_output" 2>&1 &
-    local gyro_pid=$!
-
-    local gyro_timed_out=false
-    local gyro_elapsed=0
-    while kill -0 "$gyro_pid" 2>/dev/null; do
-        if [[ $gyro_elapsed -ge $GYROFLOW_TIMEOUT ]]; then
-            gyro_timed_out=true
-            kill "$gyro_pid" 2>/dev/null || true
-            sleep 2
-            kill -9 "$gyro_pid" 2>/dev/null || true
-            break
+    for attempt in 1 2; do
+        if [[ $attempt -eq 1 ]]; then
+            max_pts=$SYNC_MAX_POINTS_INITIAL
+        else
+            max_pts=$AUTO_SYNC_POINTS
         fi
-        sleep 1
-        gyro_elapsed=$((gyro_elapsed + 1))
+
+        rm -f "${tmp_proxy%.mp4}.gyroflow"
+        sync_params_json=$(gyroflow_sync_params_json_from_preset "$tmp_preset" "$max_pts")
+
+        local proxy_cmd=(
+            "$GYROFLOW"
+            "$tmp_proxy"
+            "$lens_path"
+            -g "$gcsv_for_proxy"
+            --preset "$tmp_preset"
+            -s "$sync_params_json"
+        )
+        proxy_cmd+=(
+            -p "$out_params_json"
+            --export-project "$EXPORT_MODE"
+        )
+
+        gyro_output=$(mktemp "${sync_dir}/sync_log_XXXXXX")
+        LC_ALL=C.UTF-8 LANG=C.UTF-8 "${proxy_cmd[@]}" > "$gyro_output" 2>&1 &
+        gyro_pid=$!
+
+        gyro_timed_out=false
+        gyro_elapsed=0
+        while kill -0 "$gyro_pid" 2>/dev/null; do
+            if [[ $gyro_elapsed -ge $GYROFLOW_TIMEOUT ]]; then
+                gyro_timed_out=true
+                kill "$gyro_pid" 2>/dev/null || true
+                sleep 2
+                kill -9 "$gyro_pid" 2>/dev/null || true
+                break
+            fi
+            sleep 1
+            gyro_elapsed=$((gyro_elapsed + 1))
+        done
+
+        gyro_rc=0
+        wait "$gyro_pid" 2>/dev/null || gyro_rc=$?
+
+        if [[ -s "$gyro_output" ]]; then
+            sed 's/^/      gyroflow: /' "$gyro_output"
+        fi
+        rm -f "$gyro_output"
+
+        proxy_project="${tmp_proxy%.mp4}.gyroflow"
+        if [[ ! -f "$proxy_project" ]]; then
+            proxy_project=$(
+                find "$sync_dir" -maxdepth 1 -name "$(basename "${tmp_proxy%.mp4}").gyroflow" -print -quit 2>/dev/null
+            )
+        fi
+
+        if $gyro_timed_out; then
+            echo "      sync: Gyroflow attempt $attempt timed out after ${GYROFLOW_TIMEOUT}s" >&2
+            [[ -n "$proxy_project" && -f "$proxy_project" ]] && rm -f "$proxy_project"
+            continue
+        fi
+        if [[ $gyro_rc -ne 0 ]]; then
+            echo "      sync: Gyroflow attempt $attempt exited with error code $gyro_rc" >&2
+            [[ -n "$proxy_project" && -f "$proxy_project" ]] && rm -f "$proxy_project"
+            continue
+        fi
+        if [[ ! -f "$proxy_project" ]]; then
+            echo "      sync: attempt $attempt — no proxy project file from Gyroflow" >&2
+            continue
+        fi
+
+        if python3 "$helpers_py" apply-offset-policy "$proxy_project" "$MAX_SYNC_OFFSET_MS"; then
+            if python3 "$helpers_py" offsets-min "$proxy_project" 2; then
+                sync_trim_ok=true
+                break
+            fi
+            echo "      sync: attempt $attempt — offset policy left fewer than 2 sync points (max_sync_points=$max_pts); retry or widen --max-offset-ms" >&2
+        else
+            echo "      sync: attempt $attempt — apply-offset-policy failed (max_sync_points=$max_pts)" >&2
+        fi
+        rm -f "$proxy_project"
+        proxy_project=""
     done
 
-    local gyro_rc=0
-    wait "$gyro_pid" 2>/dev/null || gyro_rc=$?
-
-    # Allow Gyroflow's deferred settings flush to finish before we restore the file.
     sleep 2
     gyroflow_settings_end_restore
 
-    # Print Gyroflow output
-    if [[ -s "$gyro_output" ]]; then
-        sed 's/^/      gyroflow: /' "$gyro_output"
-    fi
-    rm -f "$gyro_output"
-
-    # Locate the proxy's exported .gyroflow file (same directory as tmp_proxy)
-    local proxy_project="${tmp_proxy%.mp4}.gyroflow"
-    if [[ ! -f "$proxy_project" ]]; then
-        proxy_project=$(
-            find "$sync_dir" -maxdepth 1 -name "$(basename "${tmp_proxy%.mp4}").gyroflow" -print -quit 2>/dev/null
-        )
-    fi
-
-    if $gyro_timed_out; then
-        echo "      sync: Gyroflow timed out after ${GYROFLOW_TIMEOUT}s" >&2
+    if ! $sync_trim_ok; then
+        echo "      sync: FAILED — optical-flow sync did not yield usable offsets after 2 attempts" >&2
         rm -f "$tmp_proxy" "$tmp_preset"
         [[ "$gcsv_for_proxy" != "$gcsv_path" ]] && rm -f "$gcsv_for_proxy"
-        [[ -n "$proxy_project" ]] && rm -f "$proxy_project"
-        return 1
-    fi
-
-    if [[ $gyro_rc -ne 0 ]]; then
-        echo "      sync: Gyroflow exited with error code $gyro_rc" >&2
-        rm -f "$tmp_proxy" "$tmp_preset"
-        [[ "$gcsv_for_proxy" != "$gcsv_path" ]] && rm -f "$gcsv_for_proxy"
-        [[ -n "$proxy_project" ]] && rm -f "$proxy_project"
-        return 1
-    fi
-
-    if [[ ! -f "$proxy_project" ]]; then
-        echo "      sync: Gyroflow did not produce a proxy project file" >&2
-        rm -f "$tmp_proxy" "$tmp_preset"
-        [[ "$gcsv_for_proxy" != "$gcsv_path" ]] && rm -f "$gcsv_for_proxy"
+        rm -f "$project_file"
         return 1
     fi
 
     echo "      gyroflow: auto-sync complete"
 
     # ── d) Extract offsets + synchronization from proxy project and merge into DNG project
-    python3 - "$proxy_project" "$project_file" <<'PYEOF'
-import json, os, sys
-
-proxy_path   = sys.argv[1]
-project_path = sys.argv[2]
-
-
-def deep_merge(base, override):
-    for key, val in override.items():
-        if key in base and isinstance(base[key], dict) and isinstance(val, dict):
-            deep_merge(base[key], val)
-        else:
-            base[key] = val
-
-
-with open(proxy_path, "r") as f:
-    proxy = json.load(f)
-
-with open(project_path, "r") as f:
-    project = json.load(f)
-
-offsets = proxy.get("offsets") or {}
-if not offsets:
-    keys = list(proxy.keys())[:15]
-    print(
-        "      sync: warning — proxy project has no offsets "
-        f"(if do_autosync is false in preset or has_accurate_timestamps is set in .gcsv, autosync is skipped; top keys: {keys})",
-        file=sys.stderr,
-    )
-    sys.exit(0)
-
-project["offsets"] = offsets
-
-# Gyroflow GUI expects synchronization settings alongside offsets (same as a full CLI export).
-psync = proxy.get("synchronization")
-if isinstance(psync, dict) and psync:
-    tgt = project.setdefault("synchronization", {})
-    if isinstance(tgt, dict):
-        deep_merge(tgt, psync)
-    else:
-        project["synchronization"] = dict(psync)
-
-# Use the full gyro_source from the CLI export (same gcsv + lens + autosync as proxy).
-# The Python DNG builder only fills a minimal stub; cherry-picking fields leaves out
-# fields Gyroflow expects for sync UI / project_has_motion_data (file_metadata, IMU
-# transforms, etc.). Keep the DNG project's filepath URL to the real .gcsv (and
-# filepath_bookmark if the builder added one).
-proxy_gyro = proxy.get("gyro_source") or {}
-project_gyro = project.get("gyro_source") or {}
-merged = dict(proxy_gyro)
-for k in ("filepath", "filepath_bookmark"):
-    if k in project_gyro and project_gyro[k]:
-        merged[k] = project_gyro[k]
-project["gyro_source"] = merged
-
-project["version"] = 3
-project.setdefault("videofile_bookmark", "")
-out = project.get("output")
-if isinstance(out, dict):
-    out.setdefault("output_folder_bookmark", "")
-    out.setdefault("pixel_format", "")
-
-with open(project_path, "w") as f:
-    json.dump(project, f, indent=2)
-
-try:
-    sz = os.path.getsize(project_path)
-except OSError:
-    sz = 0
-
-fm = merged.get("file_metadata")
-has_fm = (isinstance(fm, str) and fm.strip()) or (isinstance(fm, dict) and fm)
-extra = " + full gyro_source from CLI" + (" (incl. file_metadata)" if has_fm else "")
-print(
-    f"      sync: merged {len(offsets)} offset(s) + synchronization{extra} into project ({sz} bytes)"
-)
-PYEOF
-
-    local merge_rc=$?
+    if ! python3 "$helpers_py" "$proxy_project" "$project_file"; then
+        echo "      sync: merge into DNG project failed" >&2
+        rm -f "$tmp_proxy" "$proxy_project" "$tmp_preset"
+        [[ "$gcsv_for_proxy" != "$gcsv_path" ]] && rm -f "$gcsv_for_proxy"
+        rm -f "$project_file"
+        return 1
+    fi
 
     # ── e) Clean up ──────────────────────────────────────────────────
     rm -f "$tmp_proxy" "$proxy_project" "$tmp_preset"
     [[ "$gcsv_for_proxy" != "$gcsv_path" ]] && rm -f "$gcsv_for_proxy"
 
-    return $merge_rc
+    return 0
 }
 
 # ── Build the list of footage items ──────────────────────────────────
 footage_items=()
 shopt -s nullglob
 
+# DNG sequence directories first; skip standalone video files whose stem matches a
+# sequence folder (same stem as 260403_…_VIDEO_25mm.dng/ + 260403_…_VIDEO_25mm.mp4).
 for entry in "$VIDEO_FOLDER"/*; do
     if [[ -d "$entry" ]]; then
         if is_image_sequence_dir "$entry"; then
             footage_items+=("$entry")
         fi
-    elif [[ -f "$entry" ]]; then
+    fi
+done
+
+for entry in "$VIDEO_FOLDER"/*; do
+    if [[ -f "$entry" ]]; then
         ext="${entry##*.}"
         ext_lower="$(echo "$ext" | tr '[:upper:]' '[:lower:]')"
         if [[ "$ext_lower" =~ ^($VIDEO_EXTENSIONS)$ ]]; then
+            vid_stem="$(basename "$entry")"
+            vid_stem="${vid_stem%.*}"
+            if [[ -d "$VIDEO_FOLDER/$vid_stem" ]] && is_image_sequence_dir "$VIDEO_FOLDER/$vid_stem"; then
+                continue
+            fi
             footage_items+=("$entry")
         fi
     fi
@@ -1024,6 +1043,11 @@ failed=0
 
 for item in "${footage_items[@]}"; do
     total=$((total + 1))
+    # Machine-readable progress for UIs (Gyroflow Batch app parses this line).
+    # Use awk+fflush so the line is not stuck in block-buffered stdout when this
+    # script is piped (e.g. SwiftUI Process) — plain `echo` can defer until exit.
+    awk -v c="$total" -v t="${#footage_items[@]}" \
+        'BEGIN { printf "GYROFLOW_BATCH_PROGRESS %d %d\n", c, t; fflush(); exit }'
     stem="$(basename "$item")"
     is_seq=false
 
@@ -1118,10 +1142,11 @@ for item in "${footage_items[@]}"; do
             if sync_dng_project "$item" "$SEQ_FPS" "$lens_profile" \
                     "$motion_file" "$PROJECT_DEFAULTS" "$project_file"; then
                 echo "  OK  $stem  (synced)"
+                success=$((success + 1))
             else
-                echo "WARN  $stem — project built but sync failed (usable, sync manually in GUI)"
+                echo "FAIL  $stem — DNG project sync failed (project file removed)"
+                failed=$((failed + 1))
             fi
-            success=$((success + 1))
         else
             echo "FAIL  $stem — Python project builder failed"
             failed=$((failed + 1))
@@ -1169,96 +1194,121 @@ print(json.dumps({"output_path": p}))
 ' "$item" "$sync_dir"
         )
 
-        # Same sync overrides as DNG proxy: do_autosync + exactly AUTO_SYNC_POINTS
-        # sync points (sanitized preset may omit or zero max_sync_points).
-        vid_sync_params_json=$(gyroflow_sync_params_json_from_preset "$tmp_preset")
-
-        cmd=(
-            "$GYROFLOW"
-            "$item"                          # video file
-            "$lens_profile"                  # lens profile .json (positional)
-            -g "$motion_file"                # gyro / motion data
-            --preset "$tmp_preset"           # sanitized — no stale paths
-            -s "$vid_sync_params_json"       # force auto-sync point count
-            -p "$vid_out_params_json"        # anchor export next to our sync dir
-            --export-project "$EXPORT_MODE"  # export project file, don't render
-        )
+        # Auto-sync: try SYNC_MAX_POINTS_INITIAL then AUTO_SYNC_POINTS; apply-offset-policy
+        # drops |offset| > MAX_SYNC_OFFSET_MS then keeps first/last in range (may be none).
+        sync_sidecar="$sync_dir/$stem.gyroflow"
+        default_location="$(dirname "$item")/$stem.gyroflow"
+        vid_helpers="${GYROFLOW_BATCH_SCRIPT_DIR}/gyroflow_batch_helpers.py"
+        video_export_ok=false
 
         echo "      output:  $project_file"
         echo ""
-        echo "      cmd:     ${cmd[*]}"
-        echo ""
 
-        gyro_output=$(mktemp "${sync_dir}/gyroflow_out_XXXXXX")
-        LC_ALL=C.UTF-8 LANG=C.UTF-8 "${cmd[@]}" > "$gyro_output" 2>&1 &
-        gyro_pid=$!
-
-        gyro_timed_out=false
-        gyro_elapsed=0
-        gyro_lines_shown=0
-        while kill -0 "$gyro_pid" 2>/dev/null; do
-            if [[ $gyro_elapsed -ge $GYROFLOW_TIMEOUT ]]; then
-                gyro_timed_out=true
-                kill "$gyro_pid" 2>/dev/null || true
-                sleep 2
-                kill -9 "$gyro_pid" 2>/dev/null || true
-                break
+        for attempt in 1 2; do
+            if [[ $attempt -eq 1 ]]; then
+                max_pts=$SYNC_MAX_POINTS_INITIAL
+            else
+                max_pts=$AUTO_SYNC_POINTS
             fi
-            # Stream new Gyroflow output in real time
+
+            vid_sync_params_json=$(gyroflow_sync_params_json_from_preset "$tmp_preset" "$max_pts")
+            rm -f "$sync_sidecar"
+
+            cmd=(
+                "$GYROFLOW"
+                "$item"                          # video file
+                "$lens_profile"                  # lens profile .json (positional)
+                -g "$motion_file"                # gyro / motion data
+                --preset "$tmp_preset"           # sanitized — no stale paths
+                -s "$vid_sync_params_json"       # force auto-sync point count
+                -p "$vid_out_params_json"        # anchor export next to our sync dir
+                --export-project "$EXPORT_MODE"  # export project file, don't render
+            )
+
+            echo "      attempt $attempt (max_sync_points=$max_pts)"
+            echo "      cmd:     ${cmd[*]}"
+            echo ""
+
+            gyro_output=$(mktemp "${sync_dir}/gyroflow_out_XXXXXX")
+            LC_ALL=C.UTF-8 LANG=C.UTF-8 "${cmd[@]}" > "$gyro_output" 2>&1 &
+            gyro_pid=$!
+
+            gyro_timed_out=false
+            gyro_elapsed=0
+            gyro_lines_shown=0
+            while kill -0 "$gyro_pid" 2>/dev/null; do
+                if [[ $gyro_elapsed -ge $GYROFLOW_TIMEOUT ]]; then
+                    gyro_timed_out=true
+                    kill "$gyro_pid" 2>/dev/null || true
+                    sleep 2
+                    kill -9 "$gyro_pid" 2>/dev/null || true
+                    break
+                fi
+                new_lines=$(wc -l < "$gyro_output" | tr -d ' ')
+                if [[ $new_lines -gt $gyro_lines_shown ]]; then
+                    tail -n +$((gyro_lines_shown + 1)) "$gyro_output" | sed 's/^/      /'
+                    gyro_lines_shown=$new_lines
+                elif [[ $((gyro_elapsed % 15)) -eq 0 && $gyro_elapsed -gt 0 ]]; then
+                    cpu_pct=$(ps -p "$gyro_pid" -o %cpu= 2>/dev/null | tr -d ' ' || echo "?")
+                    open_files=$(lsof -p "$gyro_pid" 2>/dev/null | wc -l | tr -d ' ' || echo "?")
+                    echo "      … waiting (${gyro_elapsed}s elapsed, cpu=${cpu_pct}%, open_files=${open_files})"
+                fi
+                sleep 1
+                gyro_elapsed=$((gyro_elapsed + 1))
+            done
+
+            gyro_rc=0
+            wait "$gyro_pid" 2>/dev/null || gyro_rc=$?
+
             new_lines=$(wc -l < "$gyro_output" | tr -d ' ')
             if [[ $new_lines -gt $gyro_lines_shown ]]; then
                 tail -n +$((gyro_lines_shown + 1)) "$gyro_output" | sed 's/^/      /'
-                gyro_lines_shown=$new_lines
-            elif [[ $((gyro_elapsed % 15)) -eq 0 && $gyro_elapsed -gt 0 ]]; then
-                cpu_pct=$(ps -p "$gyro_pid" -o %cpu= 2>/dev/null | tr -d ' ' || echo "?")
-                open_files=$(lsof -p "$gyro_pid" 2>/dev/null | wc -l | tr -d ' ' || echo "?")
-                echo "      … waiting (${gyro_elapsed}s elapsed, cpu=${cpu_pct}%, open_files=${open_files})"
             fi
-            sleep 1
-            gyro_elapsed=$((gyro_elapsed + 1))
+            rm -f "$gyro_output"
+
+            export_src=""
+            if [[ -f "$sync_sidecar" ]]; then
+                export_src="$sync_sidecar"
+            elif [[ -f "$default_location" ]]; then
+                export_src="$default_location"
+            fi
+
+            if $gyro_timed_out; then
+                echo "FAIL  $stem — Gyroflow attempt $attempt timed out after ${GYROFLOW_TIMEOUT}s (killed)" >&2
+                [[ -n "$export_src" ]] && rm -f "$export_src"
+                continue
+            fi
+            if [[ $gyro_rc -ne 0 ]]; then
+                echo "FAIL  $stem — Gyroflow attempt $attempt exited with error code $gyro_rc" >&2
+                [[ -n "$export_src" ]] && rm -f "$export_src"
+                continue
+            fi
+            if [[ -z "$export_src" || ! -f "$export_src" ]]; then
+                echo "      sync: attempt $attempt — Gyroflow produced no project file (checked sidecar + next to source)" >&2
+                continue
+            fi
+
+            if python3 "$vid_helpers" apply-offset-policy "$export_src" "$MAX_SYNC_OFFSET_MS"; then
+                if [[ "$export_src" != "$project_file" ]]; then
+                    mv -f "$export_src" "$project_file"
+                fi
+                video_export_ok=true
+                break
+            fi
+            echo "      sync: attempt $attempt — apply-offset-policy failed (max_sync_points=$max_pts)" >&2
+            rm -f "$export_src"
         done
-
-        gyro_rc=0
-        wait "$gyro_pid" 2>/dev/null || gyro_rc=$?
-
-        # Print any remaining output not yet shown
-        new_lines=$(wc -l < "$gyro_output" | tr -d ' ')
-        if [[ $new_lines -gt $gyro_lines_shown ]]; then
-            tail -n +$((gyro_lines_shown + 1)) "$gyro_output" | sed 's/^/      /'
-        fi
-        rm -f "$gyro_output"
 
         sleep 2
         gyroflow_settings_end_restore
         rm -f "$tmp_preset"
 
-        if $gyro_timed_out; then
-            echo "FAIL  $stem — Gyroflow timed out after ${GYROFLOW_TIMEOUT}s (killed)"
-            failed=$((failed + 1))
-        elif [[ $gyro_rc -eq 0 ]]; then
-            # Prefer next to source; else next to -p output in .gyroflow_sync/
-            default_location="$(dirname "$item")/$stem.gyroflow"
-            sync_sidecar="$sync_dir/$stem.gyroflow"
-            found=""
-            if [[ -f "$default_location" ]]; then
-                found="$default_location"
-            elif [[ -f "$sync_sidecar" ]]; then
-                found="$sync_sidecar"
-            fi
-            if [[ -n "$found" && "$found" != "$project_file" ]]; then
-                mv "$found" "$project_file"
-            fi
-
-            if [[ -f "$project_file" ]]; then
-                echo "  OK  $stem"
-                success=$((success + 1))
-            else
-                echo "WARN  $stem — Gyroflow exited OK but project file not found"
-                echo "      Check if Gyroflow wrote it to an unexpected location."
-                failed=$((failed + 1))
-            fi
+        if $video_export_ok; then
+            echo "  OK  $stem"
+            success=$((success + 1))
         else
-            echo "FAIL  $stem — Gyroflow exited with error code $gyro_rc"
+            echo "FAIL  $stem — video export / auto-sync failed after 2 attempts (project file removed if present)"
+            rm -f "$project_file"
             failed=$((failed + 1))
         fi
     fi

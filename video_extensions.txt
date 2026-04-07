@@ -1,0 +1,10 @@
+# Supported video extensions (one per line, lowercase). Used by
+# gyroflow_export_projects.sh and resolve_gyroflow_timeline.py — add new formats here only.
+mp4
+mov
+avi
+mkv
+mxf
+braw
+r3d
+insv

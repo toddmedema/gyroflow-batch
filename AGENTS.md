@@ -15,11 +15,16 @@ files by filename conventions, applies a shared preset, and invokes the
 
 ```
 gyroflow-batch/
-├── AGENTS.md                        ← this file
-└── gyroflow_export_projects.sh      ← the entire codebase (one Bash script)
+├── AGENTS.md                         ← this file
+├── gyroflow_export_projects.sh       ← batch .gyroflow export (Bash)
+├── gyroflow_batch_helpers.py         ← shared DNG ordering, JSON merge (used by the script)
+├── video_extensions.txt              ← supported video extensions (single source with Resolve script)
+├── resolve_gyroflow_timeline.py      ← optional stage 2: Resolve Studio import + Fusion Gyroflow OFX
+├── resolve_gyroflow_strategy_a_smoke_test.py
+└── RESOLVE_GYROFLOW.md               ← Resolve scripting prerequisites and usage
 ```
 
-No dependencies to install, no build step, no tests.
+The bash script has no install step. The Resolve Python scripts require **DaVinci Resolve Studio** and the [scripting environment](https://www.blackmagicdesign.com/support/family/davinci-resolve-and-fusion) (see `RESOLVE_GYROFLOW.md`).
 
 ## How the script works (pipeline per footage item)
 
@@ -74,12 +79,16 @@ root `version` (3 for Gyroflow 1.6.x GUI) as current app exports.
 - **Lens profile**: First `.json` in `LENS_FOLDER` whose filename matches
   `(^|[_-])<N>mm([_.-]|$)`.
 - **Idempotent**: Skips any item where `PROJECT_FOLDER/<stem>.gyroflow` exists.
-- **Supported video extensions**: `mp4`, `mov`, `avi`, `mkv`, `mxf`, `braw`,
-  `r3d`, `insv` (case-insensitive).
+- **Supported video extensions**: listed in `video_extensions.txt` (one extension per line,
+  lowercase). The bash script and `resolve_gyroflow_timeline.py` both read this file — add
+  new formats there only.
 - **DNG sequences**: A subdirectory of `VIDEO_FOLDER` containing at least one
   `.dng` file. Project files are built directly with an embedded Python script
   (no Gyroflow CLI involved), then automatically synced via an ffmpeg proxy
-  `.mp4` under `PROJECT_FOLDER/.gyroflow_sync/`. The Python builder reads the first DNG's TIFF header for
+  `.mp4` under `PROJECT_FOLDER/.gyroflow_sync/`. **Which file is “first”** in the
+  sequence (and the literal `*.dng` / `*.DNG` extension for ffmpeg) is defined only in
+  `gyroflow_batch_helpers.py` (`canonical_dng_filenames` / `dng_sequence_metadata`) so the
+  builder and proxy sync always agree. The Python builder reads the first DNG's TIFF header for
   dimensions, counts frames, reads the lens profile JSON and .gcsv header,
   merges the preset, and writes the project JSON. The `videofile` URL in the
   output points to the original first DNG in the sequence directory.
@@ -90,15 +99,21 @@ root `version` (3 for Gyroflow 1.6.x GUI) as current app exports.
 |--------------------|---------|-------|
 | `GYROFLOW`         | `/Applications/Gyroflow.app/Contents/MacOS/gyroflow` | macOS path; change for other OS |
 | `EXPORT_MODE`      | `2` | 1=default, 2=with gyro data, 3=processed gyro, 4=video+project |
-| `VIDEO_EXTENSIONS` | `mp4\|mov\|avi\|mkv\|mxf\|braw\|r3d\|insv` | Pipe-delimited regex alternation |
+| `VIDEO_EXTENSIONS` | (from `video_extensions.txt` at startup) | Pipe-delimited regex alternation built from that file |
 | `GYROFLOW_TIMEOUT` | `300` | Max seconds per Gyroflow invocation before killing |
+
+## Gyroflow GUI and batch runs
+
+The script temporarily replaces Gyroflow’s Application Support `settings.json` (and related
+state) while exporting. **Close the Gyroflow GUI during a batch run** to avoid races with
+that shared global state.
 
 ## Dependencies
 
 | Dependency | Required | Purpose |
 |------------|----------|---------|
 | `bash` (3.2+) | Yes | Script runtime; avoids `${var,,}` for macOS compat |
-| `python3` | Yes | Builds DNG sequence project files; merges fps into presets |
+| `python3` | Yes | Builds DNG sequence project files; merges fps into presets (`gyroflow_batch_helpers.py` must sit next to the script) |
 | Gyroflow app | Yes | CLI for video files and DNG proxy sync |
 | `ffmpeg` | Yes | Creates proxy .mp4 from DNG sequences for auto-sync |
 | Standard Unix tools | Yes | `find`, `sort`, `head`, `sed`, `mktemp`, `tr`, `wc`, `basename`, `dirname` |
@@ -149,6 +164,11 @@ keys, and path-like strings (including **`/tmp/`** and **`/var/folders/`** on
 macOS) are removed so a dirty `PROJECT_DEFAULTS` cannot steer exports to old
 folders.
 
+**Sanitizer caveat**: any string value that looks like a filesystem path (for example
+containing `/Users/` or `/home/`) may be stripped, not only known Gyroflow keys. Do not rely
+on preset-only absolute paths for custom fields; use relative paths or set them in the app
+after import if needed.
+
 The Gyroflow invocation passes **`-p`** JSON with **`output_path`**, **`output_folder`**, and
 **`output_filename`** derived from the proxy `.mp4` path so the export target is
 the same directory as the proxy inside `.gyroflow_sync/`.
@@ -178,13 +198,21 @@ valid and can be synced manually in the Gyroflow GUI.
 
 ## Common modification points
 
-- **Add video formats**: Append to `VIDEO_EXTENSIONS`.
+- **Add video formats**: Add a line to `video_extensions.txt` (lowercase extension).
 - **Change Gyroflow path**: Edit `GYROFLOW`.
 - **Change export mode**: Edit `EXPORT_MODE` (applies to video files only).
 - **Change focal-length regex**: Edit `extract_focal_length()`.
 - **Change lens matching logic**: Edit `find_lens_profile()`.
 - **Change DNG project schema**: Edit the Python heredoc in `build_dng_project()`.
 - **Change proxy sync settings**: Edit `sync_dng_project()` (ffmpeg flags, proxy resolution, offset merge logic).
+
+## Automated tests (optional)
+
+Pure-Python helpers are covered by `pytest` (no Gyroflow or Resolve required):
+
+```bash
+python3 -m venv .venv && .venv/bin/pip install pytest && .venv/bin/pytest
+```
 
 ## Portability notes
 
