@@ -1,0 +1,46 @@
+name: Build macOS app
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-macos-${{ github.event.release.tag_name }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # normalize_icon.py needs Pillow when repo-root icon.png is present
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Pillow (icon → .icns)
+        run: pip install pillow
+
+      - name: Build GyroflowBatch.app
+        env:
+          ICON_PYTHON: python3
+        run: bash app/build.sh
+
+      - name: Zip app bundle
+        run: |
+          ditto -c -k --keepParent app/GyroflowBatch.app \
+            "GyroflowBatch-macos-${{ github.event.release.tag_name }}.zip"
+
+      - name: Upload to release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ github.event.release.tag_name }}" \
+            "GyroflowBatch-macos-${{ github.event.release.tag_name }}.zip" \
+            --clobber

@@ -1,6 +1,13 @@
 app/.icon-1024.png
 .DS_Store
 .venv/
+__pycache__/
+*.py[cod]
+
+# Python tooling (pytest, optional coverage)
+.pytest_cache/
+.coverage
+htmlcov/
 
 # Build output (app/build.sh: swiftc + GyroflowBatch.app bundle)
 app/GyroflowBatch.app/
