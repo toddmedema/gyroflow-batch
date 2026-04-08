@@ -380,6 +380,37 @@ def _seek_timeline_to_clip(
         log(f"WARN: seek timeline for Fusion clip: {e}")
 
 
+def _timeline_max_end_frame_all_video_tracks(timeline) -> Optional[int]:
+    """
+    Latest end frame among clips on any video track (Resolve's timeline
+    GetEndFrame() can follow only one track; append must clear all tracks).
+    """
+    max_end: Optional[int] = None
+    try:
+        n = timeline.GetTrackCount("video")
+    except Exception:
+        return None
+    for i in range(1, int(n) + 1):
+        try:
+            items = timeline.GetItemListInTrack("video", i)
+        except Exception:
+            continue
+        if not items:
+            continue
+        for item in items:
+            try:
+                end = item.GetEnd()
+            except Exception:
+                continue
+            if isinstance(end, float):
+                end = int(round(end))
+            else:
+                end = int(end)
+            if max_end is None or end > max_end:
+                max_end = end
+    return max_end
+
+
 def _seek_timeline_to_end_for_append(
     resolve,
     timeline,
@@ -393,11 +424,13 @@ def _seek_timeline_to_end_for_append(
     try:
         project = resolve.GetProjectManager().GetCurrentProject()
         fps = _parse_timeline_fps(project) if project else 24.0
-        try:
-            end_frame = int(timeline.GetEndFrame())
-        except Exception as e:
-            log(f"WARN: timeline.GetEndFrame(): {e}")
-            return
+        end_frame: Optional[int] = _timeline_max_end_frame_all_video_tracks(timeline)
+        if end_frame is None:
+            try:
+                end_frame = int(timeline.GetEndFrame())
+            except Exception as e:
+                log(f"WARN: timeline.GetEndFrame(): {e}")
+                return
         tc = _timeline_frame_to_absolute_timecode(timeline, end_frame, fps, log=log)
         ok = False
         for page in ("cut", "edit"):

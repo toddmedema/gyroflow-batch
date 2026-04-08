@@ -1,5 +1,7 @@
 # gyroflow-batch
 
+**[Download the latest release](https://github.com/toddmedema/gyroflow-batch/releases/latest)**
+
 Batch-generates [Gyroflow](https://gyroflow.xyz/) **`.gyroflow` project files** from a folder of footage. It does **not** render or stabilize video—only projects you open in Gyroflow or hand to its CLI.
 
 For each clip or DNG-sequence folder, it matches `.gcsv` motion data, a lens profile, and a shared preset, then writes projects into your output folder.

@@ -35,12 +35,12 @@ jobs:
       - name: Zip app bundle
         run: |
           ditto -c -k --keepParent app/GyroflowBatch.app \
-            "GyroflowBatch-macos-${{ github.event.release.tag_name }}.zip"
+            "GyroflowBatch-macos.zip"
 
       - name: Upload to release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh release upload "${{ github.event.release.tag_name }}" \
-            "GyroflowBatch-macos-${{ github.event.release.tag_name }}.zip" \
+            "GyroflowBatch-macos.zip" \
             --clobber

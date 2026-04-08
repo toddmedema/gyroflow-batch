@@ -516,16 +516,24 @@ struct ContentView: View {
             }
 
             HStack(alignment: .center, spacing: 12) {
-                HStack(spacing: 6) {
-                    Text("\(videoFootageCounts.videos)")
-                        .monospacedDigit()
-                    Text("/")
-                        .foregroundColor(.secondary)
-                    Text("\(videoFootageCounts.dngSequences)")
-                        .monospacedDigit()
-                    Text("videos / DNG sequences")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
+                Group {
+                    if runner.isRunning, runner.activeTask == .generateProjects {
+                        HStack(spacing: 6) {
+                            Text("\(videoFootageCounts.videos)")
+                                .monospacedDigit()
+                            Text("/")
+                                .foregroundColor(.secondary)
+                            Text("\(videoFootageCounts.dngSequences)")
+                                .monospacedDigit()
+                            Text("videos / DNG sequences")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                    } else {
+                        Text("\(videoFootageCounts.videos) videos, \(videoFootageCounts.dngSequences) DNG sequences")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
                 }
                 .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
 
@@ -636,6 +644,8 @@ struct ContentView: View {
             HStack(alignment: .center, spacing: 12) {
                 HStack(spacing: 6) {
                     Text("\(gyroflowProjectCount)")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
                         .monospacedDigit()
                     Text(".gyroflow projects")
                         .font(.caption)
