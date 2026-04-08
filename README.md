@@ -2,7 +2,7 @@
 
 **[Download the latest release](https://github.com/toddmedema/gyroflow-batch/releases/latest)**
 
-Batch-generates [Gyroflow](https://gyroflow.xyz/) **`.gyroflow` project files** from a folder of footage. It does **not** render or stabilize video—only projects you open in Gyroflow or hand to its CLI.
+Batch-generates [Gyroflow](https://gyroflow.xyz/) **`.gyroflow` project files** from a folder of footage, and optionally insert them directly into Davinci Resolve with the Gyroflow Fusion Plugin pre-wired.
 
 For each clip or DNG-sequence folder, it matches `.gcsv` motion data, a lens profile, and a shared preset, then writes projects into your output folder.
 
@@ -14,7 +14,7 @@ The workflow is written for **macOS** (default Gyroflow path is the `.app` bundl
 |------|-----|
 | **Python 3** | Builds DNG sequence projects; merges FPS into presets (`gyroflow_batch_helpers.py` must sit next to the script) |
 | **[Gyroflow](https://gyroflow.xyz/)** | CLI for video exports; proxy sync for DNG (see below) |
-| **ffmpeg** | Lightweight proxy `.mp4` from DNG sequences so sync avoids the DNG CLI hang |
+| **ffmpeg** | For DNG sequences only: Renders lightweight proxy `.mp4` from DNG sequences (Gyroflow CLI currently hangs on image sequences) |
 
 No `pip install` for batch export. Optional: `pytest` for helper tests ([Tests](#tests)).
 
