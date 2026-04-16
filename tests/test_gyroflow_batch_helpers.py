@@ -172,8 +172,10 @@ def test_trim_offsets_negative_within_max():
     }
 
 
-def test_trim_offsets_single_survivor_returns_empty():
-    assert trim_offsets_by_max_abs_ms({"2": 100.0, "0": 9000.0, "1": 8000.0}, 500.0) == {}
+def test_trim_offsets_single_survivor_kept():
+    assert trim_offsets_by_max_abs_ms({"2": 100.0, "0": 9000.0, "1": 8000.0}, 500.0) == {
+        "2": 100.0,
+    }
 
 
 def test_trim_offsets_non_int_keys_endpoints():
@@ -202,14 +204,14 @@ def test_apply_sync_offset_policy_all_outside_yields_empty_offsets(tmp_path):
     assert json.loads(p.read_text(encoding="utf-8"))["offsets"] == {}
 
 
-def test_apply_sync_offset_policy_one_in_window_yields_empty_offsets(tmp_path):
+def test_apply_sync_offset_policy_one_in_window_yields_single_offset(tmp_path):
     p = tmp_path / "z.gyroflow"
     p.write_text(
         json.dumps({"version": 3, "offsets": {"0": 100.0, "1": 9000.0}}),
         encoding="utf-8",
     )
     assert apply_sync_offset_policy_to_gyroflow_file(str(p), 500.0) is True
-    assert json.loads(p.read_text(encoding="utf-8"))["offsets"] == {}
+    assert json.loads(p.read_text(encoding="utf-8"))["offsets"] == {"0": 100.0}
 
 
 def test_gyroflow_offsets_meet_minimum(tmp_path):
@@ -221,6 +223,7 @@ def test_gyroflow_offsets_meet_minimum(tmp_path):
     assert gyroflow_offsets_meet_minimum(str(p), 2) is True
     assert gyroflow_offsets_meet_minimum(str(p), 3) is False
     p.write_text(json.dumps({"offsets": {"0": 1.0}}), encoding="utf-8")
+    assert gyroflow_offsets_meet_minimum(str(p), 1) is True
     assert gyroflow_offsets_meet_minimum(str(p), 2) is False
 
 

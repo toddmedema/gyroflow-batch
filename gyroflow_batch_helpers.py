@@ -178,8 +178,8 @@ def trim_offsets_by_max_abs_ms(offsets: Any, max_abs_offset_ms: float) -> Dict[s
 
     Among points still in range, keep only the **first and last** by sync-point
     key order (integer keys numerically, then other keys lexicographically).
-
-    If zero or one point remains after filtering, returns ``{}`` (no sync points).
+    If exactly one point remains, that single entry is returned (same as first
+    and last). If none remain, returns ``{}``.
     """
     if not isinstance(offsets, dict) or max_abs_offset_ms < 0:
         return {}
@@ -192,13 +192,13 @@ def trim_offsets_by_max_abs_ms(offsets: Any, max_abs_offset_ms: float) -> Dict[s
     if not filtered:
         return {}
     keys_sorted = _offset_keys_sorted(filtered.keys())
-    if len(keys_sorted) < 2:
+    if not keys_sorted:
         return {}
     first, last = keys_sorted[0], keys_sorted[-1]
     return {first: filtered[first], last: filtered[last]}
 
 
-def gyroflow_offsets_meet_minimum(path: str, minimum: int = 2) -> bool:
+def gyroflow_offsets_meet_minimum(path: str, minimum: int = 1) -> bool:
     """
     Return True if ``path`` is readable JSON with ``offsets`` a dict containing
     at least ``minimum`` entries. Used after apply-offset-policy to ensure the
@@ -225,7 +225,7 @@ def apply_sync_offset_policy_to_gyroflow_file(path: str, max_abs_offset_ms: floa
     ``trim_offsets_by_max_abs_ms``, and write back atomically.
     ``max_abs_offset_ms`` removes autosync points with ``|offset|`` greater
     than this (values in the file are ms), then keeps only the first/last
-    remaining sync point. The result may have no sync points.
+    remaining sync point (or a single survivor). The result may have no sync points.
     Returns ``True`` on success, ``False`` on load/save error.
     """
     try:

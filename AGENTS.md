@@ -193,8 +193,18 @@ offsets computed from the proxy encode are identical to what you'd get from the
 full-resolution DNGs. The Gyroflow CLI works fine on regular .mp4 files — it
 only deadlocks on DNG sequences directly.
 
-Sync failure is a warning, not a hard error — the DNG project file is still
-valid and can be synced manually in the Gyroflow GUI.
+If optical-flow proxy sync never produces offsets that pass the offset policy
+(after two Gyroflow attempts), the script prints a **warning**, **keeps** the DNG
+`.gyroflow` built in step 5a, and counts the item as **OK (un-synced)** so you
+can open it in Gyroflow and sync manually. If the later Python **merge** of
+proxy offsets into the DNG project fails, the item still **fails** and the
+project file is removed (that indicates a real I/O or JSON error).
+
+After `--max-offset-ms` filtering, **one** surviving sync point is enough to
+merge offsets (Gyroflow may return one good point and one outlier; a tight
+`--max-offset-ms` strips the outlier and the good point is kept). With **two or
+more** in-range points, only the first and last (by sync-point key order) are
+kept.
 
 ## Common modification points
 

@@ -70,7 +70,8 @@ GYROFLOW_TIMEOUT=300
 
 # Optical-flow auto-sync: first CLI pass asks for up to this many sync points, then
 # offsets with |value| > MAX_SYNC_OFFSET_MS are dropped; of those left, only the first
-# and last sync point are kept (gyroflow_batch_helpers). Second pass uses AUTO_SYNC_POINTS.
+# and last sync point are kept (or a single in-range survivor; gyroflow_batch_helpers).
+# Second pass uses AUTO_SYNC_POINTS.
 SYNC_MAX_POINTS_INITIAL=6
 
 # Fallback max sync points (second Gyroflow attempt) if the first pass fails.
@@ -111,7 +112,8 @@ Usage:
   --force            Rebuild .gyroflow files even if they already exist (needed after
                      changing sync behavior or to re-run DNG proxy merge)
   --max-offset-ms    Drop autosync points with |offset| > this (ms), then keep only the
-                     first/last of those still in range (may be zero). search_size 5s. Default 5000.
+                     first/last of those still in range, or one survivor (may be zero).
+                     search_size 5s. Default 5000.
 EOF
     exit 1
 fi
@@ -683,6 +685,8 @@ sync_dng_project() {
     local project_file="$6"  # existing DNG project file to enrich
     # Motion file passed to Gyroflow for proxy sync (copy with header tweaks if needed).
     local gcsv_for_proxy="$gcsv_path"
+    # Caller reads this after return 0: "synced" (offsets merged) or "partial" (project kept, no merge).
+    LAST_DNG_SYNC_STATUS=synced
 
     # ── a) First DNG, count, literal extension (canonical — gyroflow_batch_helpers) ──
     local first_dng dng_count dng_ext
@@ -882,7 +886,7 @@ print(json.dumps(out))
 
     # Merge synchronization: -s forces do_autosync and max_sync_points (first 6, then 2).
     # After each successful export, trim with MAX_SYNC_OFFSET_MS (apply-offset-policy):
-    # drop |offset| > max, then first/last of those in range; may have no sync points.
+    # drop |offset| > max, then first/last in range (or a single survivor); may have no sync points.
     local helpers_py="${GYROFLOW_BATCH_SCRIPT_DIR}/gyroflow_batch_helpers.py"
     local sync_trim_ok=false
     local proxy_project=""
@@ -960,11 +964,11 @@ print(json.dumps(out))
         fi
 
         if python3 "$helpers_py" apply-offset-policy "$proxy_project" "$MAX_SYNC_OFFSET_MS"; then
-            if python3 "$helpers_py" offsets-min "$proxy_project" 2; then
+            if python3 "$helpers_py" offsets-min "$proxy_project" 1; then
                 sync_trim_ok=true
                 break
             fi
-            echo "      sync: attempt $attempt — offset policy left fewer than 2 sync points (max_sync_points=$max_pts); retry or widen --max-offset-ms" >&2
+            echo "      sync: attempt $attempt — offset policy left no sync points (max_sync_points=$max_pts); retry or widen --max-offset-ms" >&2
         else
             echo "      sync: attempt $attempt — apply-offset-policy failed (max_sync_points=$max_pts)" >&2
         fi
@@ -976,11 +980,12 @@ print(json.dumps(out))
     gyroflow_settings_end_restore
 
     if ! $sync_trim_ok; then
-        echo "      sync: FAILED — optical-flow sync did not yield usable offsets after 2 attempts" >&2
+        echo "      sync: WARNING — optical-flow sync did not yield usable offsets after 2 attempts; keeping DNG project (sync manually in Gyroflow if needed)" >&2
         rm -f "$tmp_proxy" "$tmp_preset"
         [[ "$gcsv_for_proxy" != "$gcsv_path" ]] && rm -f "$gcsv_for_proxy"
-        rm -f "$project_file"
-        return 1
+        [[ -n "$proxy_project" && -f "$proxy_project" ]] && rm -f "$proxy_project"
+        LAST_DNG_SYNC_STATUS=partial
+        return 0
     fi
 
     echo "      gyroflow: auto-sync complete"
@@ -1141,7 +1146,11 @@ for item in "${footage_items[@]}"; do
         if build_dng_project "$item" "$SEQ_FPS" "$lens_profile" "$motion_file" "$PROJECT_DEFAULTS" "$project_file"; then
             if sync_dng_project "$item" "$SEQ_FPS" "$lens_profile" \
                     "$motion_file" "$PROJECT_DEFAULTS" "$project_file"; then
-                echo "  OK  $stem  (synced)"
+                if [[ "${LAST_DNG_SYNC_STATUS:-synced}" == partial ]]; then
+                    echo "  OK  $stem  (un-synced)"
+                else
+                    echo "  OK  $stem  (synced)"
+                fi
                 success=$((success + 1))
             else
                 echo "FAIL  $stem — DNG project sync failed (project file removed)"
