@@ -729,7 +729,7 @@ struct ContentView: View {
             .frame(maxHeight: outputSectionExpanded ? .infinity : nil)
         }
         .padding()
-        .frame(minWidth: 700, minHeight: 650, maxWidth: .infinity, maxHeight: .infinity)
+        .frame(minWidth: 700, maxWidth: .infinity, minHeight: 650, maxHeight: .infinity)
         .onAppear {
             discoveredResolveProjects = discoverLocalResolveProjectNames()
             refreshFolderStats()
